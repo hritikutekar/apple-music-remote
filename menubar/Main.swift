@@ -96,12 +96,36 @@ final class ServiceDiscovery: NSObject, NetServiceBrowserDelegate, NetServiceDel
     }
 
     func netServiceDidResolveAddress(_ sender: NetService) {
-        guard let hostName = sender.hostName else { return }
-        // hostName looks like "DESKTOP-ABC.local." — trim the trailing dot.
-        let host = hostName.hasSuffix(".") ? String(hostName.dropLast()) : hostName
-        if let url = URL(string: "http://\(host):\(sender.port)") {
+        // Prefer the resolved hostname; fall back to a raw IPv4 address from
+        // the service's address records (some advertisers publish a hostname
+        // that isn't resolvable).
+        var host = sender.hostName
+        if host == nil, let addresses = sender.addresses {
+            host = firstIPv4Address(in: addresses)
+        }
+        guard var h = host else { return }
+        if h.hasSuffix(".") { h = String(h.dropLast()) }
+        if let url = URL(string: "http://\(h):\(sender.port)") {
             onFound(sender.name, url)
         }
+    }
+
+    private func firstIPv4Address(in addresses: [Data]) -> String? {
+        for data in addresses {
+            var name = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            let err = data.withUnsafeBytes { ptr -> Int32 in
+                guard let base = ptr.baseAddress else { return -1 }
+                return getnameinfo(base.assumingMemoryBound(to: sockaddr.self),
+                                   socklen_t(data.count),
+                                   &name, socklen_t(name.count),
+                                   nil, 0, NI_NUMERICHOST)
+            }
+            if err == 0 {
+                let s = String(cString: name)
+                if s.contains(".") { return s } // IPv4 dotted quad
+            }
+        }
+        return nil
     }
 
     func netService(_ sender: NetService, didNotResolve errorDict: [String: NSNumber]) {

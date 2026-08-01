@@ -100,12 +100,15 @@ app.listen(PORT, "0.0.0.0", () => {
 
   // Advertise via mDNS so the Mac app can find this PC without a manual IP.
   // Service type must be <= 15 chars: "_amremote._tcp".
+  // host must be a proper .local name — a bare hostname (e.g. "DESKTOP-ABC")
+  // cannot be resolved by clients.
   const bonjour = new Bonjour();
   bonjour.publish({
     name: `Apple Music Remote (${hostname()})`,
     type: "amremote",
     protocol: "tcp",
     port: PORT,
+    host: `${hostname()}.local`,
   });
   console.log("mDNS: advertising as _amremote._tcp");
 });
