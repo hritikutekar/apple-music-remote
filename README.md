@@ -19,7 +19,7 @@ The server reads Windows' **GSMTC** (Global System Media Transport Controls) —
 - **Zero-config discovery** — the server announces itself via mDNS/Bonjour and the Mac app finds it automatically; no IP addresses to type
 - Now playing in your Mac menu bar: `♪ Title — Artist`, with artwork in the dropdown
 - Play / pause, next, previous
-- **Global keyboard shortcuts** on the Mac: `⌃⌥Space` play/pause, `⌃⌥→` next, `⌃⌥←` previous — work from any app, no permissions required
+- **Keyboard media keys (F7 ⏮ · F8 ⏯ · F9 ⏭) control the PC** — captured system-wide before macOS sees them; toggleable in the menu. Requires a one-time Accessibility permission grant (see below). Bonus shortcuts without any permission: `⌃⌥Space` play/pause, `⌃⌥→` next, `⌃⌥←` previous
 - System volume slider + mute
 - Polls every 2 seconds; shows "Offline" when the PC is unreachable
 
@@ -85,6 +85,12 @@ dns-sd -B _amremote._tcp
 Manual fallback: find the PC's address with `ipconfig` and enter it as `192.168.1.50:4789` via **Set PC Address…**. A manually set address always takes priority; choose **Use Auto-Discovery** in the menu to switch back.
 
 The app is unsigned, so if Gatekeeper blocks it: *System Settings → Privacy & Security → Open Anyway*.
+
+### Media keys (F7/F8/F9)
+
+To make the keyboard's media keys control the PC, open the app menu and click **Capture Media Keys (F7–F9)**. macOS will ask for **Accessibility** permission — grant it in *System Settings → Privacy & Security → Accessibility → AppleMusicRemote*, then toggle the menu item again (or wait a couple of seconds; it starts automatically once permission is granted).
+
+While capture is on, F7/F8/F9 control the PC and no longer trigger local Mac apps. Toggle the menu item off to return them to macOS.
 
 ## How it works
 

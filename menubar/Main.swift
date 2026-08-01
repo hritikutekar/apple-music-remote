@@ -176,6 +176,102 @@ final class HotKeyManager {
     }
 }
 
+// MARK: - Media key capture (F7/F8/F9)
+
+/// Intercepts the keyboard's media keys (⏮ ⏯ ⏭) via a CGEventTap and
+/// consumes them before macOS routes them to local "Now Playing" apps.
+/// Requires Accessibility permission.
+final class MediaKeyCapture {
+    static let shared = MediaKeyCapture()
+
+    /// Called on the main queue with 16 = play/pause, 17 = next, 18 = previous.
+    var onKey: ((Int) -> Void)?
+
+    private(set) var enabled = false
+    fileprivate var eventTap: CFMachPort?
+    private var runLoopSource: CFRunLoopSource?
+
+    // NX key codes (NX_KEYTYPE_*). Modern macOS keyboards emit FAST (19)
+    // and REWIND (20) for the F9/F7 keys rather than NEXT (17)/PREVIOUS (18),
+    // so we accept both pairs.
+    static let playPause = 16
+    static let next = 17
+    static let previous = 18
+    static let fastForward = 19
+    static let rewind = 20
+
+    // kCGEventSystemDefined — not exposed in Swift's CGEventType enum
+    static let systemDefinedType: UInt32 = 14
+
+    @discardableResult
+    func start() -> Bool {
+        guard eventTap == nil else { enabled = true; return true }
+        let mask = CGEventMask(1 << MediaKeyCapture.systemDefinedType)
+        guard let tap = CGEvent.tapCreate(
+            tap: .cghidEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: mask,
+            callback: mediaKeyTapCallback,
+            userInfo: nil
+        ) else {
+            NSLog("MediaKeyCapture: tapCreate FAILED (no Accessibility permission?)")
+            return false // no Accessibility permission
+        }
+        NSLog("MediaKeyCapture: event tap started")
+        eventTap = tap
+        runLoopSource = CFMachPortCreateRunLoopSource(nil, tap, 0)
+        CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+        enabled = true
+        return true
+    }
+
+    func stop() {
+        if let source = runLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
+        }
+        runLoopSource = nil
+        eventTap = nil
+        enabled = false
+    }
+}
+
+private func mediaKeyTapCallback(
+    proxy: CGEventTapProxy, type: CGEventType, event: CGEvent, refcon: UnsafeMutableRawPointer?
+) -> Unmanaged<CGEvent>? {
+    // macOS may disable the tap under load — re-enable it.
+    if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+        if let tap = MediaKeyCapture.shared.eventTap {
+            CGEvent.tapEnable(tap: tap, enable: true)
+        }
+        return Unmanaged.passUnretained(event)
+    }
+
+    guard type.rawValue == MediaKeyCapture.systemDefinedType,
+          let nsEvent = NSEvent(cgEvent: event),
+          nsEvent.subtype.rawValue == 8 // NX_SUBTYPE_AUX_CONTROL_BUTTONS
+    else {
+        return Unmanaged.passUnretained(event)
+    }
+
+    let data1 = nsEvent.data1
+    let keyCode = (data1 & 0xFFFF_0000) >> 16
+    let keyState = (data1 & 0x0000_FF00) >> 8 // 0xA = key down, 0xB = key up
+
+    guard keyState == 0xA,
+          [MediaKeyCapture.playPause, MediaKeyCapture.next, MediaKeyCapture.previous,
+           MediaKeyCapture.fastForward, MediaKeyCapture.rewind].contains(keyCode)
+    else {
+        return Unmanaged.passUnretained(event)
+    }
+
+    DispatchQueue.main.async {
+        MediaKeyCapture.shared.onKey?(keyCode)
+    }
+    return nil // consume the event so macOS doesn't also handle it
+}
+
 // MARK: - Menu bar app
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -194,14 +290,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var volumeSlider: NSSlider!
     private var muteItem: NSMenuItem!
     private var volumeDebounce: Timer?
+    private var mediaKeysItem: NSMenuItem!
+    private var mediaKeysWanted = true
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         setTitle("♪ …")
         buildMenu()
         registerHotKeys()
+        setupMediaKeyCapture()
         startDiscovery()
         startPolling()
+    }
+
+    // MARK: Media keys (F7/F8/F9)
+
+    private func setupMediaKeyCapture() {
+        NSLog("MediaKeyCapture: launch, AXIsProcessTrusted=\(AXIsProcessTrusted())")
+        MediaKeyCapture.shared.onKey = { [weak self] key in
+            switch key {
+            case MediaKeyCapture.playPause:
+                self?.onPlayPause()
+            case MediaKeyCapture.next, MediaKeyCapture.fastForward:
+                self?.onNext()
+            case MediaKeyCapture.previous, MediaKeyCapture.rewind:
+                self?.onPrevious()
+            default:
+                break
+            }
+        }
+        if AXIsProcessTrusted() {
+            MediaKeyCapture.shared.start()
+        }
+    }
+
+    @objc private func toggleMediaKeys() {
+        NSLog("MediaKeyCapture: toggle clicked, enabled=\(MediaKeyCapture.shared.enabled) trusted=\(AXIsProcessTrusted())")
+        if MediaKeyCapture.shared.enabled {
+            mediaKeysWanted = false
+            MediaKeyCapture.shared.stop()
+        } else {
+            mediaKeysWanted = true
+            guard AXIsProcessTrusted() else {
+                // Triggers the system prompt directing the user to
+                // Settings → Privacy & Security → Accessibility.
+                let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+                _ = AXIsProcessTrustedWithOptions(opts)
+                return
+            }
+            MediaKeyCapture.shared.start()
+        }
+        refreshMediaKeysItem()
+    }
+
+    private func refreshMediaKeysItem() {
+        if MediaKeyCapture.shared.enabled {
+            mediaKeysItem.state = .on
+            mediaKeysItem.title = "Capture Media Keys (F7–F9)"
+        } else if AXIsProcessTrusted() {
+            mediaKeysItem.state = .off
+            mediaKeysItem.title = "Capture Media Keys (F7–F9)"
+        } else {
+            mediaKeysItem.state = .off
+            mediaKeysItem.title = "Capture Media Keys (F7–F9) — needs Accessibility permission"
+        }
     }
 
     // MARK: Hotkeys
@@ -295,6 +447,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
+        mediaKeysItem = NSMenuItem(title: "Capture Media Keys (F7–F9)", action: #selector(toggleMediaKeys), keyEquivalent: "")
+        mediaKeysItem.target = self
+        refreshMediaKeysItem()
+        menu.addItem(mediaKeysItem)
+
         pcItem = NSMenuItem(title: "PC: searching…", action: nil, keyEquivalent: "")
         pcItem.isEnabled = false
         menu.addItem(pcItem)
@@ -329,6 +486,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func poll() {
+        // Permission may have been granted since the last tick — start the
+        // event tap automatically once it is.
+        if mediaKeysWanted && !MediaKeyCapture.shared.enabled && AXIsProcessTrusted() {
+            NSLog("MediaKeyCapture: permission granted, starting tap")
+            MediaKeyCapture.shared.start()
+        }
         client.fetchNowPlaying { [weak self] result in
             DispatchQueue.main.async {
                 guard let self = self else { return }
@@ -460,6 +623,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 extension AppDelegate: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
+        refreshMediaKeysItem()
         poll()
     }
 }
