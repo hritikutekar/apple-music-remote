@@ -1,0 +1,4 @@
+node_modules/
+dist/
+menubar/AppleMusicRemote.app/
+.DS_Store

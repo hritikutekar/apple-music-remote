@@ -1,0 +1,24 @@
+{
+  "name": "apple-music-remote-server",
+  "version": "1.0.0",
+  "description": "HTTP server exposing Windows media session (GSMTC) controls for Apple Music on Windows",
+  "private": true,
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc && node dist/index.js"
+  },
+  "dependencies": {
+    "@nodert-win11/windows.media.control": "^0.1.6",
+    "@nodert-win11/windows.storage.streams": "^0.1.6",
+    "bonjour-service": "^1.4.4",
+    "express": "^4.21.2",
+    "loudness": "^0.4.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.11.0",
+    "typescript": "^5.4.0"
+  }
+}
