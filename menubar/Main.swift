@@ -1,4 +1,5 @@
 import Cocoa
+import Carbon.HIToolbox
 
 // MARK: - Model
 
@@ -108,6 +109,49 @@ final class ServiceDiscovery: NSObject, NetServiceBrowserDelegate, NetServiceDel
     }
 }
 
+// MARK: - Global hotkeys
+
+/// System-wide hotkeys via Carbon RegisterEventHotKey — works while any app
+/// is focused and needs no accessibility permissions.
+final class HotKeyManager {
+    static let shared = HotKeyManager()
+
+    private var handlers: [UInt32: () -> Void] = [:]
+    private var refs: [EventHotKeyRef?] = []
+    private var eventHandlerInstalled = false
+
+    /// 'AMRT'
+    private static let signature: OSType = 0x414D5254
+
+    func register(keyCode: UInt32, modifiers: UInt32, id: UInt32, handler: @escaping () -> Void) {
+        handlers[id] = handler
+        installHandlerIfNeeded()
+        let hotKeyID = EventHotKeyID(signature: HotKeyManager.signature, id: id)
+        var ref: EventHotKeyRef?
+        let status = RegisterEventHotKey(keyCode, modifiers, hotKeyID, GetEventDispatcherTarget(), 0, &ref)
+        if status != noErr {
+            NSLog("RegisterEventHotKey failed for id \(id): \(status)")
+        }
+        refs.append(ref)
+    }
+
+    private func installHandlerIfNeeded() {
+        guard !eventHandlerInstalled else { return }
+        eventHandlerInstalled = true
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetEventDispatcherTarget(), { _, event, _ -> OSStatus in
+            var hotKeyID = EventHotKeyID()
+            GetEventParameter(event, EventParamName(kEventParamDirectObject),
+                              EventParamType(typeEventHotKeyID), nil,
+                              MemoryLayout<EventHotKeyID>.size, nil, &hotKeyID)
+            DispatchQueue.main.async {
+                HotKeyManager.shared.handlers[hotKeyID.id]?()
+            }
+            return noErr
+        }, 1, &spec, nil, nil)
+    }
+}
+
 // MARK: - Menu bar app
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -131,8 +175,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         setTitle("♪ …")
         buildMenu()
+        registerHotKeys()
         startDiscovery()
         startPolling()
+    }
+
+    // MARK: Hotkeys
+    //
+    // ⌃⌥Space play/pause · ⌃⌥→ next · ⌃⌥← previous
+    // (⌃⌥ = Control+Option; chosen to avoid clashing with macOS shortcuts)
+
+    private func registerHotKeys() {
+        let mods = UInt32(controlKey | optionKey)
+        HotKeyManager.shared.register(keyCode: UInt32(kVK_Space), modifiers: mods, id: 1) { [weak self] in
+            self?.onPlayPause()
+        }
+        HotKeyManager.shared.register(keyCode: UInt32(kVK_RightArrow), modifiers: mods, id: 2) { [weak self] in
+            self?.onNext()
+        }
+        HotKeyManager.shared.register(keyCode: UInt32(kVK_LeftArrow), modifiers: mods, id: 3) { [weak self] in
+            self?.onPrevious()
+        }
     }
 
     // MARK: Discovery
@@ -175,15 +238,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
-        playPauseItem = NSMenuItem(title: "Play / Pause", action: #selector(onPlayPause), keyEquivalent: "")
+        playPauseItem = NSMenuItem(title: "Play / Pause  ⌃⌥Space", action: #selector(onPlayPause), keyEquivalent: "")
         playPauseItem.target = self
         menu.addItem(playPauseItem)
 
-        let prevItem = NSMenuItem(title: "⏮ Previous", action: #selector(onPrevious), keyEquivalent: "")
+        let prevItem = NSMenuItem(title: "⏮ Previous  ⌃⌥←", action: #selector(onPrevious), keyEquivalent: "")
         prevItem.target = self
         menu.addItem(prevItem)
 
-        let nextItem = NSMenuItem(title: "⏭ Next", action: #selector(onNext), keyEquivalent: "")
+        let nextItem = NSMenuItem(title: "⏭ Next  ⌃⌥→", action: #selector(onNext), keyEquivalent: "")
         nextItem.target = self
         menu.addItem(nextItem)
 
@@ -272,16 +335,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             setTitle("♪ " + truncate(artist.isEmpty ? title : "\(title) — \(artist)", max: 40))
             trackItem.title = [np.title, np.artist, np.album]
                 .compactMap { $0 }.joined(separator: " — ")
-            playPauseItem.title = np.status == "playing" ? "⏸ Pause" : "▶️ Play"
+            playPauseItem.title = np.status == "playing" ? "⏸ Pause  ⌃⌥Space" : "▶️ Play  ⌃⌥Space"
         } else {
             setTitle("♪ Not playing")
             trackItem.title = "Nothing playing"
-            playPauseItem.title = "▶️ Play"
+            playPauseItem.title = "▶️ Play  ⌃⌥Space"
         }
 
         if let dataURL = np.artwork,
-           let comma = dataURL.firstIndex(of: ","),
-           let data = Data(base64Encoded: String(dataURL[dataURL.index(after: comma)...])),
+           let marker = dataURL.range(of: ";base64,"),
+           let data = Data(base64Encoded: String(dataURL[marker.upperBound...])),
            let image = NSImage(data: data) {
             image.size = NSSize(width: 32, height: 32)
             artworkItem.image = image

@@ -34,8 +34,18 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <string>12.0</string>
     <key>LSUIElement</key>
     <true/>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Apple Music Remote uses your local network to find and control the Windows PC playing your music.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_amremote._tcp</string>
+    </array>
 </dict>
 </plist>
 PLIST
+
+# Ad-hoc sign the bundle with the Info.plist bound in — required for macOS
+# to track the app in Privacy & Security (Local Network permission).
+codesign --force --sign - "$APP"
 
 echo "Built $APP — open it with: open $APP"

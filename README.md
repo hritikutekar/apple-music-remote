@@ -19,6 +19,7 @@ The server reads Windows' **GSMTC** (Global System Media Transport Controls) —
 - **Zero-config discovery** — the server announces itself via mDNS/Bonjour and the Mac app finds it automatically; no IP addresses to type
 - Now playing in your Mac menu bar: `♪ Title — Artist`, with artwork in the dropdown
 - Play / pause, next, previous
+- **Global keyboard shortcuts** on the Mac: `⌃⌥Space` play/pause, `⌃⌥→` next, `⌃⌥←` previous — work from any app, no permissions required
 - System volume slider + mute
 - Polls every 2 seconds; shows "Offline" when the PC is unreachable
 
@@ -45,9 +46,10 @@ apple-music-remote server listening on http://0.0.0.0:4789
 
 ```powershell
 New-NetFirewallRule -DisplayName "Apple Music Remote" -Direction Inbound -Protocol TCP -LocalPort 4789 -Action Allow
+New-NetFirewallRule -DisplayName "Apple Music Remote mDNS" -Direction Inbound -Protocol UDP -LocalPort 5353 -Action Allow
 ```
 
-Discovery also needs mDNS (UDP 5353), which Windows allows by default on Private networks. Make sure your network profile is set to **Private** (*Settings → Network & internet → Wi-Fi/Ethernet → your network*), not Public — discovery is blocked on Public profiles.
+Discovery also needs mDNS (UDP 5353), so make sure your network profile is set to **Private** (*Settings → Network & internet → Wi-Fi/Ethernet → your network*), not Public — discovery is blocked on Public profiles.
 
 ### Autostart (optional)
 
@@ -69,7 +71,18 @@ open AppleMusicRemote.app
 
 On first launch the app searches the network for the PC automatically — within a few seconds the menu should show `PC: Apple Music Remote (YOUR-PC) (auto)`. No configuration needed.
 
-If discovery fails (e.g. the Windows network profile is Public), the app falls back to asking for the PC's address — find it with `ipconfig` on the PC and enter it as `192.168.1.50:4789`. A manually set address always takes priority; choose **Use Auto-Discovery** in the menu to switch back.
+macOS will ask for **Local Network** permission on first launch — allow it, otherwise discovery is silently blocked. If you denied it earlier: *System Settings → Privacy & Security → Local Network → AppleMusicRemote → on*, then restart the app.
+
+If discovery fails, run this in a Mac terminal to see whether the PC's announcement is reaching the Mac at all:
+
+```sh
+dns-sd -B _amremote._tcp
+```
+
+- Service appears → the Mac app is the problem (check Local Network permission above).
+- Nothing appears → the PC side: server running with the `mDNS: advertising` line in its console, Windows network profile set to Private, UDP 5353 allowed (firewall rule above). Some routers also block multicast between devices ("AP/client isolation" — disable it).
+
+Manual fallback: find the PC's address with `ipconfig` and enter it as `192.168.1.50:4789` via **Set PC Address…**. A manually set address always takes priority; choose **Use Auto-Discovery** in the menu to switch back.
 
 The app is unsigned, so if Gatekeeper blocks it: *System Settings → Privacy & Security → Open Anyway*.
 
