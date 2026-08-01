@@ -272,6 +272,41 @@ private func mediaKeyTapCallback(
     return nil // consume the event so macOS doesn't also handle it
 }
 
+// MARK: - Design
+
+/// Apple Music–inspired palette and helpers.
+private enum Theme {
+    /// Apple Music red.
+    static let accent = NSColor(calibratedRed: 0.98, green: 0.18, blue: 0.33, alpha: 1)
+    static let trackBackground = NSColor.systemGray.withAlphaComponent(0.22)
+
+    static func symbol(_ name: String, size: CGFloat, weight: NSFont.Weight = .regular) -> NSImage? {
+        let config = NSImage.SymbolConfiguration(pointSize: size, weight: weight)
+        return NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(config)
+    }
+}
+
+/// Thin, rounded playback progress bar (non-interactive — the server has no
+/// seek endpoint, so this only displays position).
+private final class ProgressBar: NSView {
+    var fraction: Double = 0 { didSet { needsDisplay = true } }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let h: CGFloat = 4
+        let y = (bounds.height - h) / 2
+        NSBezierPath(roundedRect: NSRect(x: 0, y: y, width: bounds.width, height: h),
+                     xRadius: h / 2, yRadius: h / 2).setClip()
+        Theme.trackBackground.setFill()
+        bounds.fill()
+        let w = max(0, min(1, fraction)) * bounds.width
+        if w > 0 {
+            Theme.accent.setFill()
+            NSRect(x: 0, y: 0, width: w, height: bounds.height).fill()
+        }
+    }
+}
+
 // MARK: - Menu bar app
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -279,28 +314,274 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let discovery = ServiceDiscovery()
     private var statusItem: NSStatusItem!
     private var timer: Timer?
+    private var progressTimer: Timer?
     private var current: NowPlaying?
     private var reachable = false
-
-    // Menu items we update live
-    private var artworkItem: NSMenuItem!
-    private var trackItem: NSMenuItem!
-    private var pcItem: NSMenuItem!
-    private var playPauseItem: NSMenuItem!
-    private var volumeSlider: NSSlider!
-    private var muteItem: NSMenuItem!
-    private var volumeDebounce: Timer?
-    private var mediaKeysItem: NSMenuItem!
     private var mediaKeysWanted = true
 
+    // Popover UI
+    private let popover = NSPopover()
+    private var artworkView: NSImageView!
+    private var titleLabel: NSTextField!
+    private var artistLabel: NSTextField!
+    private var progressBar: ProgressBar!
+    private var elapsedLabel: NSTextField!
+    private var remainingLabel: NSTextField!
+    private var playPauseButton: NSButton!
+    private var volumeSlider: NSSlider!
+    private var muteButton: NSButton!
+    private var statusLabel: NSTextField!
+
+    private var volumeDebounce: Timer?
+    private var displayedPosition: Double = 0
+    private var displayedDuration: Double = 0
+    private var placeholderArtwork: NSImage?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        setTitle("♪ …")
-        buildMenu()
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        if let button = statusItem.button {
+            button.image = Theme.symbol("music.note", size: 14, weight: .medium)
+            button.imagePosition = .imageOnly
+            button.target = self
+            button.action = #selector(togglePopover)
+        }
+        buildPopover()
         registerHotKeys()
         setupMediaKeyCapture()
         startDiscovery()
         startPolling()
+    }
+
+    // MARK: Popover construction
+
+    private func buildPopover() {
+        let root = NSView()
+        root.translatesAutoresizingMaskIntoConstraints = false
+
+        // Artwork with rounded corners and a soft shadow.
+        let artworkContainer = NSView()
+        artworkContainer.translatesAutoresizingMaskIntoConstraints = false
+        artworkContainer.wantsLayer = true
+        artworkContainer.layer?.shadowColor = NSColor.black.cgColor
+        artworkContainer.layer?.shadowOpacity = 0.28
+        artworkContainer.layer?.shadowRadius = 12
+        artworkContainer.layer?.shadowOffset = NSSize(width: 0, height: -5)
+
+        artworkView = NSImageView()
+        artworkView.translatesAutoresizingMaskIntoConstraints = false
+        artworkView.wantsLayer = true
+        artworkView.layer?.cornerRadius = 10
+        artworkView.layer?.masksToBounds = true
+        artworkView.imageScaling = .scaleAxesIndependently
+        artworkContainer.addSubview(artworkView)
+
+        titleLabel = makeLabel(font: .systemFont(ofSize: 13, weight: .semibold),
+                               color: .labelColor, alignment: .center)
+        artistLabel = makeLabel(font: .systemFont(ofSize: 11, weight: .regular),
+                                color: Theme.accent, alignment: .center)
+
+        progressBar = ProgressBar()
+        progressBar.translatesAutoresizingMaskIntoConstraints = false
+
+        elapsedLabel = makeLabel(font: .monospacedDigitSystemFont(ofSize: 10, weight: .regular),
+                                 color: .secondaryLabelColor, alignment: .left)
+        remainingLabel = makeLabel(font: .monospacedDigitSystemFont(ofSize: 10, weight: .regular),
+                                   color: .secondaryLabelColor, alignment: .right)
+
+        let prevButton = transportButton("backward.fill", size: 18, action: #selector(onPrevious))
+        playPauseButton = transportButton("play.fill", size: 26, action: #selector(onPlayPause))
+        let nextButton = transportButton("forward.fill", size: 18, action: #selector(onNext))
+        let transport = NSStackView(views: [prevButton, playPauseButton, nextButton])
+        transport.orientation = .horizontal
+        transport.spacing = 34
+        transport.alignment = .centerY
+        transport.translatesAutoresizingMaskIntoConstraints = false
+
+        muteButton = NSButton(image: Theme.symbol("speaker.fill", size: 12) ?? NSImage(),
+                              target: self, action: #selector(onToggleMute))
+        muteButton.isBordered = false
+        muteButton.contentTintColor = .secondaryLabelColor
+        muteButton.translatesAutoresizingMaskIntoConstraints = false
+
+        volumeSlider = NSSlider()
+        volumeSlider.minValue = 0
+        volumeSlider.maxValue = 100
+        volumeSlider.controlSize = .small
+        volumeSlider.trackFillColor = Theme.accent
+        volumeSlider.target = self
+        volumeSlider.action = #selector(onVolumeChanged(_:))
+        volumeSlider.isContinuous = true
+        volumeSlider.translatesAutoresizingMaskIntoConstraints = false
+
+        let speakerHigh = NSImageView(image: Theme.symbol("speaker.wave.2.fill", size: 12) ?? NSImage())
+        speakerHigh.contentTintColor = .secondaryLabelColor
+        speakerHigh.translatesAutoresizingMaskIntoConstraints = false
+
+        let volumeRow = NSStackView(views: [muteButton, volumeSlider, speakerHigh])
+        volumeRow.orientation = .horizontal
+        volumeRow.spacing = 8
+        volumeRow.alignment = .centerY
+        volumeRow.translatesAutoresizingMaskIntoConstraints = false
+
+        let separator = NSBox()
+        separator.boxType = .separator
+        separator.translatesAutoresizingMaskIntoConstraints = false
+
+        statusLabel = makeLabel(font: .systemFont(ofSize: 10, weight: .regular),
+                                color: .secondaryLabelColor, alignment: .left)
+        statusLabel.stringValue = "Searching for PC…"
+        // Truncate instead of colliding with the gear button on long names.
+        statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let gearButton = NSButton(image: Theme.symbol("gearshape", size: 13) ?? NSImage(),
+                                  target: self, action: #selector(showSettings(_:)))
+        gearButton.isBordered = false
+        gearButton.contentTintColor = .secondaryLabelColor
+        gearButton.translatesAutoresizingMaskIntoConstraints = false
+
+        let subviews: [NSView] = [artworkContainer, titleLabel, artistLabel, progressBar,
+                                  elapsedLabel, remainingLabel, transport, volumeRow,
+                                  separator, statusLabel, gearButton]
+        for v in subviews {
+            root.addSubview(v)
+        }
+
+        NSLayoutConstraint.activate([
+            root.widthAnchor.constraint(equalToConstant: 300),
+
+            artworkContainer.topAnchor.constraint(equalTo: root.topAnchor, constant: 22),
+            artworkContainer.centerXAnchor.constraint(equalTo: root.centerXAnchor),
+            artworkContainer.widthAnchor.constraint(equalToConstant: 200),
+            artworkContainer.heightAnchor.constraint(equalToConstant: 200),
+            artworkView.topAnchor.constraint(equalTo: artworkContainer.topAnchor),
+            artworkView.bottomAnchor.constraint(equalTo: artworkContainer.bottomAnchor),
+            artworkView.leadingAnchor.constraint(equalTo: artworkContainer.leadingAnchor),
+            artworkView.trailingAnchor.constraint(equalTo: artworkContainer.trailingAnchor),
+
+            titleLabel.topAnchor.constraint(equalTo: artworkContainer.bottomAnchor, constant: 16),
+            titleLabel.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
+            titleLabel.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -24),
+
+            artistLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 2),
+            artistLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            artistLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
+
+            progressBar.topAnchor.constraint(equalTo: artistLabel.bottomAnchor, constant: 16),
+            progressBar.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
+            progressBar.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -24),
+            progressBar.heightAnchor.constraint(equalToConstant: 6),
+
+            elapsedLabel.topAnchor.constraint(equalTo: progressBar.bottomAnchor, constant: 4),
+            elapsedLabel.leadingAnchor.constraint(equalTo: progressBar.leadingAnchor),
+            remainingLabel.centerYAnchor.constraint(equalTo: elapsedLabel.centerYAnchor),
+            remainingLabel.trailingAnchor.constraint(equalTo: progressBar.trailingAnchor),
+
+            transport.topAnchor.constraint(equalTo: elapsedLabel.bottomAnchor, constant: 10),
+            transport.centerXAnchor.constraint(equalTo: root.centerXAnchor),
+
+            volumeRow.topAnchor.constraint(equalTo: transport.bottomAnchor, constant: 12),
+            volumeRow.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
+            volumeRow.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -24),
+
+            separator.topAnchor.constraint(equalTo: volumeRow.bottomAnchor, constant: 16),
+            separator.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
+            separator.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -24),
+
+            statusLabel.topAnchor.constraint(equalTo: separator.bottomAnchor, constant: 8),
+            statusLabel.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
+            statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: gearButton.leadingAnchor, constant: -8),
+            statusLabel.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -10),
+
+            gearButton.centerYAnchor.constraint(equalTo: statusLabel.centerYAnchor),
+            gearButton.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
+        ])
+
+        let controller = NSViewController()
+        controller.view = root
+        popover.contentViewController = controller
+        popover.behavior = .transient
+        popover.animates = true
+
+        showPlaceholderArtwork()
+    }
+
+    private func makeLabel(font: NSFont, color: NSColor, alignment: NSTextAlignment) -> NSTextField {
+        let label = NSTextField(labelWithString: "")
+        label.font = font
+        label.textColor = color
+        label.alignment = alignment
+        label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 1
+        label.translatesAutoresizingMaskIntoConstraints = false
+        return label
+    }
+
+    private func transportButton(_ symbol: String, size: CGFloat, action: Selector) -> NSButton {
+        let button = NSButton(image: Theme.symbol(symbol, size: size, weight: .medium) ?? NSImage(),
+                              target: self, action: action)
+        button.isBordered = false
+        button.contentTintColor = .labelColor
+        return button
+    }
+
+    private func showPlaceholderArtwork() {
+        if placeholderArtwork == nil {
+            let size: CGFloat = 200
+            placeholderArtwork = NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
+                NSColor.systemGray.withAlphaComponent(0.18).setFill()
+                rect.fill()
+                if let note = Theme.symbol("music.note", size: size * 0.35, weight: .light) {
+                    let s = size * 0.4
+                    let r = NSRect(x: (size - s) / 2, y: (size - s) / 2, width: s, height: s)
+                    note.draw(in: r, from: .zero, operation: .sourceOver, fraction: 0.45)
+                }
+                return true
+            }
+        }
+        artworkView.image = placeholderArtwork
+    }
+
+    // MARK: Popover toggle & settings menu
+
+    @objc private func togglePopover() {
+        guard let button = statusItem.button else { return }
+        if popover.isShown {
+            popover.performClose(nil)
+        } else {
+            poll()
+            NSApp.activate(ignoringOtherApps: true)
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        }
+    }
+
+    @objc private func showSettings(_ sender: NSButton) {
+        let menu = NSMenu()
+
+        let mediaKeysItem = NSMenuItem(title: "", action: #selector(toggleMediaKeys), keyEquivalent: "")
+        mediaKeysItem.target = self
+        configureMediaKeysItem(mediaKeysItem)
+        menu.addItem(mediaKeysItem)
+
+        menu.addItem(.separator())
+
+        let hostItem = NSMenuItem(title: "Set PC Address…", action: #selector(promptForHost), keyEquivalent: "")
+        hostItem.target = self
+        menu.addItem(hostItem)
+
+        let autoItem = NSMenuItem(title: "Use Auto-Discovery", action: #selector(useAutoDiscovery), keyEquivalent: "")
+        autoItem.target = self
+        menu.addItem(autoItem)
+
+        let refreshItem = NSMenuItem(title: "Refresh", action: #selector(poll), keyEquivalent: "")
+        refreshItem.target = self
+        menu.addItem(refreshItem)
+
+        menu.addItem(.separator())
+
+        menu.addItem(NSMenuItem(title: "Quit Apple Music Remote",
+                                action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 6), in: sender)
     }
 
     // MARK: Media keys (F7/F8/F9)
@@ -340,19 +621,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             MediaKeyCapture.shared.start()
         }
-        refreshMediaKeysItem()
     }
 
-    private func refreshMediaKeysItem() {
+    private func configureMediaKeysItem(_ item: NSMenuItem) {
         if MediaKeyCapture.shared.enabled {
-            mediaKeysItem.state = .on
-            mediaKeysItem.title = "Capture Media Keys (F7–F9)"
+            item.state = .on
+            item.title = "Capture Media Keys (F7–F9)"
         } else if AXIsProcessTrusted() {
-            mediaKeysItem.state = .off
-            mediaKeysItem.title = "Capture Media Keys (F7–F9)"
+            item.state = .off
+            item.title = "Capture Media Keys (F7–F9)"
         } else {
-            mediaKeysItem.state = .off
-            mediaKeysItem.title = "Capture Media Keys (F7–F9) — needs Accessibility permission"
+            item.state = .off
+            item.title = "Capture Media Keys (F7–F9) — needs Accessibility permission"
         }
     }
 
@@ -384,7 +664,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard self.client.manualHost?.isEmpty != false else { return }
                 self.client.discoveredBaseURL = url
                 self.client.discoveredName = name
-                self.updatePCItem()
+                self.updateStatusLabel()
                 self.poll()
             }
         }
@@ -398,89 +678,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // MARK: Menu construction
-
-    private func buildMenu() {
-        let menu = NSMenu()
-        menu.delegate = self
-
-        artworkItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-        artworkItem.isEnabled = false
-        menu.addItem(artworkItem)
-
-        trackItem = NSMenuItem(title: "Connecting…", action: nil, keyEquivalent: "")
-        trackItem.isEnabled = false
-        menu.addItem(trackItem)
-
-        menu.addItem(.separator())
-
-        playPauseItem = NSMenuItem(title: "Play / Pause  ⌃⌥Space", action: #selector(onPlayPause), keyEquivalent: "")
-        playPauseItem.target = self
-        menu.addItem(playPauseItem)
-
-        let prevItem = NSMenuItem(title: "⏮ Previous  ⌃⌥←", action: #selector(onPrevious), keyEquivalent: "")
-        prevItem.target = self
-        menu.addItem(prevItem)
-
-        let nextItem = NSMenuItem(title: "⏭ Next  ⌃⌥→", action: #selector(onNext), keyEquivalent: "")
-        nextItem.target = self
-        menu.addItem(nextItem)
-
-        menu.addItem(.separator())
-
-        // Volume slider inside a menu item view
-        let sliderView = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 28))
-        volumeSlider = NSSlider(frame: NSRect(x: 16, y: 2, width: 168, height: 24))
-        volumeSlider.minValue = 0
-        volumeSlider.maxValue = 100
-        volumeSlider.target = self
-        volumeSlider.action = #selector(onVolumeChanged(_:))
-        volumeSlider.isContinuous = true
-        sliderView.addSubview(volumeSlider)
-        let volumeItem = NSMenuItem()
-        volumeItem.view = sliderView
-        menu.addItem(volumeItem)
-
-        muteItem = NSMenuItem(title: "Mute", action: #selector(onToggleMute), keyEquivalent: "")
-        muteItem.target = self
-        menu.addItem(muteItem)
-
-        menu.addItem(.separator())
-
-        mediaKeysItem = NSMenuItem(title: "Capture Media Keys (F7–F9)", action: #selector(toggleMediaKeys), keyEquivalent: "")
-        mediaKeysItem.target = self
-        refreshMediaKeysItem()
-        menu.addItem(mediaKeysItem)
-
-        pcItem = NSMenuItem(title: "PC: searching…", action: nil, keyEquivalent: "")
-        pcItem.isEnabled = false
-        menu.addItem(pcItem)
-
-        let hostItem = NSMenuItem(title: "Set PC Address…", action: #selector(promptForHost), keyEquivalent: "")
-        hostItem.target = self
-        menu.addItem(hostItem)
-
-        let autoItem = NSMenuItem(title: "Use Auto-Discovery", action: #selector(useAutoDiscovery), keyEquivalent: "")
-        autoItem.target = self
-        menu.addItem(autoItem)
-
-        let refreshItem = NSMenuItem(title: "Refresh", action: #selector(poll), keyEquivalent: "")
-        refreshItem.target = self
-        menu.addItem(refreshItem)
-
-        menu.addItem(.separator())
-
-        let quitItem = NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        menu.addItem(quitItem)
-
-        statusItem.menu = menu
-    }
-
     // MARK: Polling
 
     private func startPolling() {
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             self?.poll()
+        }
+        // Advance the progress bar between polls for smooth playback.
+        progressTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.tickProgress()
         }
         poll()
     }
@@ -500,56 +706,78 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.reachable = true
                     self.current = np
                     self.updateUI(np)
-                    self.updatePCItem()
+                    self.updateStatusLabel()
                 case .failure:
                     self.reachable = false
                     self.current = nil
-                    self.setTitle("♪ Offline")
-                    self.trackItem.title = self.client.baseURL == nil
+                    self.titleLabel.stringValue = self.client.baseURL == nil
                         ? "Looking for PC on the network…"
                         : "PC unreachable"
-                    self.artworkItem.image = nil
+                    self.artistLabel.stringValue = ""
+                    self.showPlaceholderArtwork()
+                    self.displayedPosition = 0
+                    self.displayedDuration = 0
+                    self.updateProgressUI()
+                    self.setPlayPauseSymbol(playing: false)
                 }
             }
         }
     }
 
+    private func tickProgress() {
+        guard let np = current, np.status == "playing" else { return }
+        if displayedDuration > 0 {
+            displayedPosition = min(displayedPosition + 0.5, displayedDuration)
+        }
+        updateProgressUI()
+    }
+
     private func updateUI(_ np: NowPlaying) {
         let hasTrack = np.title != nil && np.status != "stopped"
         if hasTrack {
-            let title = np.title ?? "Unknown"
-            let artist = np.artist ?? ""
-            setTitle("♪ " + truncate(artist.isEmpty ? title : "\(title) — \(artist)", max: 40))
-            trackItem.title = [np.title, np.artist, np.album]
-                .compactMap { $0 }.joined(separator: " — ")
-            playPauseItem.title = np.status == "playing" ? "⏸ Pause  ⌃⌥Space" : "▶️ Play  ⌃⌥Space"
+            titleLabel.stringValue = np.title ?? "Unknown"
+            artistLabel.stringValue = [np.artist, np.album].compactMap { $0 }.joined(separator: " — ")
+            setPlayPauseSymbol(playing: np.status == "playing")
         } else {
-            setTitle("♪ Not playing")
-            trackItem.title = "Nothing playing"
-            playPauseItem.title = "▶️ Play  ⌃⌥Space"
+            titleLabel.stringValue = "Nothing playing"
+            artistLabel.stringValue = ""
+            setPlayPauseSymbol(playing: false)
         }
+
+        displayedPosition = np.positionSec
+        displayedDuration = np.durationSec
+        updateProgressUI()
 
         if let dataURL = np.artwork,
            let marker = dataURL.range(of: ";base64,"),
            let data = Data(base64Encoded: String(dataURL[marker.upperBound...])),
            let image = NSImage(data: data) {
-            image.size = NSSize(width: 32, height: 32)
-            artworkItem.image = image
+            image.size = NSSize(width: 200, height: 200)
+            artworkView.image = image
         } else {
-            artworkItem.image = nil
+            showPlaceholderArtwork()
         }
 
         if let v = np.volume { volumeSlider.integerValue = v }
-        muteItem.state = (np.muted ?? false) ? .on : .off
+        let muted = np.muted ?? false
+        muteButton.image = Theme.symbol(muted ? "speaker.slash.fill" : "speaker.fill", size: 12)
     }
 
-    private func setTitle(_ text: String) {
-        statusItem.button?.title = text
-        statusItem.button?.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+    private func updateProgressUI() {
+        progressBar.fraction = displayedDuration > 0 ? displayedPosition / displayedDuration : 0
+        elapsedLabel.stringValue = formatTime(displayedPosition)
+        remainingLabel.stringValue = displayedDuration > 0
+            ? "-" + formatTime(max(0, displayedDuration - displayedPosition))
+            : "--:--"
     }
 
-    private func truncate(_ s: String, max: Int) -> String {
-        s.count <= max ? s : String(s.prefix(max - 1)) + "…"
+    private func setPlayPauseSymbol(playing: Bool) {
+        playPauseButton.image = Theme.symbol(playing ? "pause.fill" : "play.fill", size: 26, weight: .medium)
+    }
+
+    private func formatTime(_ sec: Double) -> String {
+        let total = max(0, Int(sec.rounded()))
+        return String(format: "%d:%02d", total / 60, total % 60)
     }
 
     // MARK: Actions
@@ -578,7 +806,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func onToggleMute() {
-        client.post("mute", body: ["muted": muteItem.state != .on])
+        let muted = !(current?.muted ?? false)
+        client.post("mute", body: ["muted": muted])
         refreshSoon()
     }
 
@@ -589,17 +818,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func updatePCItem() {
-        pcItem.title = "PC: \(client.sourceDescription)"
+    private func updateStatusLabel() {
+        statusLabel.stringValue = reachable
+            ? "Connected to \(client.sourceDescription)"
+            : "PC: \(client.sourceDescription)"
     }
 
     @objc private func useAutoDiscovery() {
         client.manualHost = nil
-        updatePCItem()
+        updateStatusLabel()
         poll()
     }
 
     @objc private func promptForHost() {
+        NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = "Windows PC address"
         alert.informativeText = "Only needed if auto-discovery doesn't find your PC. Enter its IP (and port if changed), e.g. 192.168.1.50:4789"
@@ -614,17 +846,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let host = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             if !host.isEmpty {
                 client.manualHost = host
-                updatePCItem()
+                updateStatusLabel()
                 poll()
             }
         }
-    }
-}
-
-extension AppDelegate: NSMenuDelegate {
-    func menuWillOpen(_ menu: NSMenu) {
-        refreshMediaKeysItem()
-        poll()
     }
 }
 
