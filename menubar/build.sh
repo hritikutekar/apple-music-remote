@@ -44,8 +44,20 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-# Ad-hoc sign the bundle with the Info.plist bound in — required for macOS
-# to track the app in Privacy & Security (Local Network permission).
-codesign --force --sign - "$APP"
+# Sign with a stable identity so macOS privacy permissions (Accessibility,
+# Local Network) survive rebuilds. Falls back to ad-hoc if none is found.
+# Override with: CODESIGN_IDENTITY="My Identity" ./build.sh
+IDENTITY="${CODESIGN_IDENTITY:-}"
+if [ -z "$IDENTITY" ]; then
+    IDENTITY=$(security find-identity -v -p codesigning | grep -m1 "Apple Development: Hritik Utekar" | sed -E 's/.*"(.*)"/\1/' || true)
+fi
+if [ -z "$IDENTITY" ]; then
+    IDENTITY=$(security find-identity -v -p codesigning | grep -m1 "Apple Development" | sed -E 's/.*"(.*)"/\1/' || true)
+fi
+if [ -n "$IDENTITY" ]; then
+    codesign --force --sign "$IDENTITY" "$APP"
+else
+    codesign --force --sign - "$APP"
+fi
 
 echo "Built $APP — open it with: open $APP"
