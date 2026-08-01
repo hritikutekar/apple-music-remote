@@ -1,9 +1,5 @@
-import {
-  GlobalSystemMediaTransportControlsSessionManager,
-  GlobalSystemMediaTransportControlsSession,
-  GlobalSystemMediaTransportControlsSessionPlaybackStatus,
-} from "@nodert-win11/windows.media.control";
-import { DataReader } from "@nodert-win11/windows.storage.streams";
+import { spawn, ChildProcess } from "child_process";
+import { getAllSessions, MediaSession } from "windows-media-sessions";
 
 export type PlaybackState = "playing" | "paused" | "stopped";
 
@@ -16,122 +12,129 @@ export interface NowPlaying {
   durationSec: number;
   /** data URL (base64) or null when no artwork is available */
   artwork: string | null;
-  /** App User Model ID of the session we are controlling */
+  /** App User Model ID of the session we are reporting on */
   sourceApp: string | null;
 }
 
-const APPLE_MUSIC_HINTS = ["applemusic", "apple.music", "appleinc"];
-
-let managerPromise: Promise<GlobalSystemMediaTransportControlsSessionManager> | null =
-  null;
-
-function getManager() {
-  if (!managerPromise) {
-    managerPromise = GlobalSystemMediaTransportControlsSessionManager.requestAsync();
-  }
-  return managerPromise;
-}
+const APPLE_MUSIC_HINTS = ["applemusic", "apple.music", "apple music"];
 
 /**
- * Pick the session to control: prefer Apple Music, then the system's
- * "current" session, then the most recently listed session.
+ * Pick the session to report on: prefer Apple Music, then any playing
+ * session, then the first session Windows knows about.
  */
-async function pickSession(): Promise<GlobalSystemMediaTransportControlsSession | null> {
-  const manager = await getManager();
-  const sessions = Array.from(manager.getSessions() ?? []);
+function pickSession(sessions: MediaSession[]): MediaSession | null {
   if (sessions.length === 0) return null;
 
   const appleMusic = sessions.find((s) => {
-    const id = (s.sourceAppUserModelId || "").toLowerCase();
-    return APPLE_MUSIC_HINTS.some((hint) => id.includes(hint));
+    const haystack =
+      `${s.sourceAppUserModelId} ${s.sourceAppDisplayName ?? ""}`.toLowerCase();
+    return APPLE_MUSIC_HINTS.some((hint) => haystack.includes(hint));
   });
   if (appleMusic) return appleMusic;
 
-  return manager.getCurrentSession() ?? sessions[0] ?? null;
-}
-
-function mapStatus(
-  status: GlobalSystemMediaTransportControlsSessionPlaybackStatus,
-): PlaybackState {
-  switch (status) {
-    case GlobalSystemMediaTransportControlsSessionPlaybackStatus.playing:
-      return "playing";
-    case GlobalSystemMediaTransportControlsSessionPlaybackStatus.paused:
-      return "paused";
-    default:
-      return "stopped";
-  }
-}
-
-/** Windows TimeSpan { duration } is in 100-nanosecond ticks. */
-function ticksToSeconds(ticks: unknown): number {
-  const n = Number(ticks);
-  return Number.isFinite(n) ? n / 10_000_000 : 0;
-}
-
-async function readArtwork(thumbnail: any): Promise<string | null> {
-  if (!thumbnail) return null;
-  let stream: any;
-  let reader: DataReader | null = null;
-  try {
-    stream = await thumbnail.openReadAsync();
-    const size = Number(stream.size);
-    if (!size || size <= 0 || size > 10 * 1024 * 1024) return null;
-
-    reader = new DataReader(stream);
-    await reader.loadAsync(size);
-
-    // NodeRT versions differ: readBytes may fill a plain array or a Buffer.
-    const arr = new Array<number>(size).fill(0);
-    reader.readBytes(arr);
-    const buf = Buffer.isBuffer(arr) ? arr : Buffer.from(arr);
-
-    const mime = stream.contentType || "image/jpeg";
-    return `data:${mime};base64,${buf.toString("base64")}`;
-  } catch {
-    return null;
-  } finally {
-    try {
-      reader?.close();
-      stream?.close?.();
-    } catch {
-      /* ignore */
-    }
-  }
+  return (
+    sessions.find((s) => s.playbackStatus === "playing") ?? sessions[0] ?? null
+  );
 }
 
 export async function getNowPlaying(): Promise<NowPlaying | null> {
-  const session = await pickSession();
-  if (!session) return null;
-
-  const [props, timeline] = await Promise.all([
-    session.getMediaPropertiesAsync(),
-    Promise.resolve(session.getTimelineProperties()),
-  ]);
-  const info = session.getPlaybackInfo();
+  const sessions = await getAllSessions();
+  const s = pickSession(sessions);
+  if (!s) return null;
 
   return {
-    title: props?.title || null,
-    artist: props?.artist || props?.albumArtist || null,
-    album: props?.albumTitle || null,
-    status: mapStatus(info.playbackStatus),
-    positionSec: ticksToSeconds(timeline?.position?.duration ?? timeline?.position),
-    durationSec: ticksToSeconds(timeline?.endTime?.duration ?? timeline?.endTime),
-    artwork: await readArtwork(props?.thumbnail),
-    sourceApp: session.sourceAppUserModelId || null,
+    title: s.title ?? null,
+    artist: s.artist ?? null,
+    album: s.albumTitle ?? null,
+    status:
+      s.playbackStatus === "playing"
+        ? "playing"
+        : s.playbackStatus === "paused"
+          ? "paused"
+          : "stopped",
+    positionSec: (s.timeline?.positionMs ?? 0) / 1000,
+    durationSec: (s.timeline?.durationMs ?? 0) / 1000,
+    artwork: s.thumbnail ?? null,
+    sourceApp: s.sourceAppUserModelId || null,
   };
 }
 
-async function withSession(
-  fn: (s: GlobalSystemMediaTransportControlsSession) => Promise<boolean>,
-): Promise<boolean> {
-  const session = await pickSession();
-  if (!session) throw new Error("no active media session");
-  return fn(session);
+// MARK: Transport — media keys via a persistent PowerShell helper
+//
+// windows-media-sessions is read-only, so transport control is done by
+// injecting hardware-style media key presses (VK_MEDIA_*) into Windows,
+// exactly what the media keys on a keyboard do. A single PowerShell child
+// process is kept alive; the C# helper class is compiled once at startup,
+// then each command is one line on stdin — no per-press startup cost.
+
+const VK = {
+  playPause: "0xB3",
+  next: "0xB0",
+  previous: "0xB1",
+} as const;
+
+const BOOTSTRAP = `
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class MediaKeys {
+  [DllImport("user32.dll")]
+  public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+  public static void Press(byte vk) {
+    keybd_event(vk, 0, 0, UIntPtr.Zero);
+    keybd_event(vk, 0, 2, UIntPtr.Zero);
+  }
+}
+'@
+function Send-MediaKey([string]$vk) { [MediaKeys]::Press([byte]$vk) }
+Write-Output "READY"
+`;
+
+let helper: ChildProcess | null = null;
+let helperReady: Promise<void> | null = null;
+
+function getHelper(): Promise<void> {
+  if (helperReady) return helperReady;
+
+  helperReady = new Promise<void>((resolve, reject) => {
+    helper = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "-"], {
+      stdio: ["pipe", "pipe", "inherit"],
+    });
+
+    const onData = (chunk: Buffer) => {
+      if (chunk.toString().includes("READY")) {
+        helper!.stdout!.off("data", onData);
+        resolve();
+      }
+    };
+    helper.stdout!.on("data", onData);
+
+    helper.on("error", reject);
+    helper.on("exit", (code) => {
+      helper = null;
+      helperReady = null;
+      if (code !== 0 && code !== null) {
+        reject(new Error(`media-key helper exited with code ${code}`));
+      }
+    });
+
+    helper.stdin!.write(BOOTSTRAP + "\n");
+  });
+
+  return helperReady;
 }
 
-export const playPause = () => withSession((s) => s.tryTogglePlayPauseAsync());
-export const next = () => withSession((s) => s.trySkipNextAsync());
-export const previous = () => withSession((s) => s.trySkipPreviousAsync());
-export const play = () => withSession((s) => s.tryPlayAsync());
-export const pause = () => withSession((s) => s.tryPauseAsync());
+async function sendMediaKey(vk: string): Promise<boolean> {
+  try {
+    await getHelper();
+    helper!.stdin!.write(`Send-MediaKey ${vk}\n`);
+    return true;
+  } catch (err) {
+    console.error("failed to send media key:", err);
+    return false;
+  }
+}
+
+export const playPause = () => sendMediaKey(VK.playPause);
+export const next = () => sendMediaKey(VK.next);
+export const previous = () => sendMediaKey(VK.previous);

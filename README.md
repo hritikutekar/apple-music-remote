@@ -12,7 +12,7 @@ Control Apple Music playing on a **Windows PC** from your **MacBook's menu bar**
                                                Edifier MR4 speakers
 ```
 
-The server talks to Windows' **GSMTC** (Global System Media Transport Controls) — the same media-session API the Windows lock screen uses. The official Apple Music Windows app registers there, so play/pause/skip and now-playing metadata (title, artist, album, artwork) work without automating the app itself. Volume control adjusts the Windows system volume.
+The server reads Windows' **GSMTC** (Global System Media Transport Controls) — the same media-session API the Windows lock screen uses — via a prebuilt .NET bridge, so now-playing metadata (title, artist, album, artwork) works without automating the app itself. Play/pause/skip are sent as hardware-style media key presses, and volume control adjusts the Windows system volume. No compilers or build tools needed on the PC — just Node.js.
 
 ## Features
 
@@ -24,10 +24,7 @@ The server talks to Windows' **GSMTC** (Global System Media Transport Controls) 
 
 ## Setup — Windows PC (server)
 
-Prerequisites:
-
-1. **Node.js LTS** — https://nodejs.org
-2. **Visual Studio Build Tools** with the "Desktop development with C++" workload — needed to compile the NodeRT native module. Install via https://visualstudio.microsoft.com/visual-cpp-build-tools/ (or `winget install Microsoft.VisualStudio.2022.BuildTools` and add the C++ workload).
+Prerequisite: **Node.js LTS** — https://nodejs.org. That's it.
 
 Then:
 
@@ -80,7 +77,8 @@ The app is unsigned, so if Gatekeeper blocks it: *System Settings → Privacy & 
 
 | Piece | Where | Tech |
 |---|---|---|
-| Media control + now playing | `server/src/media.ts` | `@nodert-win11/windows.media.control` (WinRT GSMTC bindings) |
+| Now playing | `server/src/media.ts` | `windows-media-sessions` (prebuilt .NET GSMTC bridge — no native build) |
+| Transport controls | `server/src/media.ts` | media key presses (`VK_MEDIA_*`) via a persistent PowerShell helper |
 | System volume | `server/src/volume.ts` | `loudness` |
 | HTTP API | `server/src/index.ts` | Express, port `4789` (override with `PORT` env var) |
 | LAN discovery | server + Mac app | mDNS/Bonjour (`bonjour-service` on Windows, `NetServiceBrowser` on macOS), service type `_amremote._tcp` |
@@ -99,5 +97,5 @@ Anything that can speak HTTP can drive it — e.g. from any device: `curl -X POS
 
 - Both machines must be on the same LAN.
 - The API is unauthenticated — fine on a trusted home network; don't expose the port beyond it.
-- If several apps are playing media, the server prefers the Apple Music session and falls back to the system's current session.
-- If `npm install` fails on the NodeRT step, the C++ Build Tools are missing or incomplete — install the "Desktop development with C++" workload and retry.
+- If several apps are playing media, the server prefers the Apple Music session and falls back to whatever is currently playing. Media key presses go to the system, same as your keyboard's media keys.
+- Apple Music only registers a media session with Windows once something has started playing — if `GET /now-playing` reports "stopped", hit play once on the PC.
