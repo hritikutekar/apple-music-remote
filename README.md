@@ -84,7 +84,7 @@ dns-sd -B _amremote._tcp
 
 Manual fallback: find the PC's address with `ipconfig` and enter it as `192.168.1.50:4789` via **Set PC Address…**. A manually set address always takes priority; choose **Use Auto-Discovery** in the menu to switch back.
 
-The app is unsigned, so if Gatekeeper blocks it: *System Settings → Privacy & Security → Open Anyway*.
+The build signs the app with your Apple Development identity (falls back to ad-hoc if none is found) so macOS privacy permissions survive rebuilds. Since it's not notarized, if Gatekeeper blocks it: *System Settings → Privacy & Security → Open Anyway*.
 
 ### Media keys (F7/F8/F9)
 
